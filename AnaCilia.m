@@ -6,6 +6,7 @@ function AnaCilia()
 clc;clearvars;
 p=parameter_setting();
 warning('off','all');
+
 % -------------------------------------------------
 %% == Import image file ==
 folder = fileparts(which(p.FileName));
@@ -19,73 +20,149 @@ end
 
 %% == All tiff in image ==
 [IMseries,~]=ImageTiffSeries(fullFileName);
-max_IMi=size(IMseries,2)/4;[p.ny,p.nx]=size(IMseries{1,1});
+max_IMi=p.Image_pageN/4;
+
+% max iamge (not consider now)
+if mod(p.Image_pageN,4)~=0
+else
+    for IMi=1:max_IMi
+        ori_Image = imread(fullFileName,IMi);
+        if exist('max_image','var')==0
+            max_image=ori_Image;
+        else
+            max_image = max(max_image,ori_Image);
+        end
+        eval(['ori_Image0{' num2str(IMi) '}=ori_Image;']);
+    end
+end
+if p.MaxImage==1
+    [max_image,max_imageBw]=PreImage(max_image,p);
+    [binaryImage,blob,blob2]=BlobImage(p,max_image,max_imageBw); %----[fix] % output need to be changed
+end
 
 if mod(size(IMseries,2),4)~=0
 else
-    for IMi=1:max_IMi
+    for IMi=5 %1:max_IMi
 
     %% == Analysis cell image ==
-    ori_Image = imread(fullFileName,IMi); % ori_Image: NxM unit16
-
-    binaryImage=PreImage(ori_Image,p,p.thresholdValue);
-    [binaryImage,blob,blob2]=BlobImage(binaryImage,ori_Image,p);
+    ori_Image = ori_Image0{1,IMi}; % ori_Image: NxM unit16
+    [im_Image,bw_Image]=PreImage(ori_Image,p);
+    
+    if p.MultiPages==1
+        [bw_Image,blob,blob2]=BlobImage(p,im_Image,bw_Image,ori_Image0,IMi); %if consider multi-page images
+    else
+        [bw_Image,blob,blob2]=BlobImage(p,im_Image,bw_Image);
+    end
+    % 
 
     %% == Analysis cilia image ==
     cili_Image = imread(fullFileName,IMi+max_IMi*2); % ori_Image: NxM unit16
     eval(['figure(''visible'',''' p.displayimage ''');imagesc(cili_Image);']); 
 
-    [binaryImage_c,cili_blob]=cilia(cili_Image,p);
+    [bw_ImageC,cili_blob]=cilia(cili_Image,p);
 
     %% == Integrated cell and cilia analysis ==
     [blob2,cili_blob]=cell_cilia(blob2,cili_blob,p);
-    [BW1,BW0,result]=draw_cell_cilia(binaryImage,blob2,cili_blob,cili_Image,ori_Image,binaryImage_c,p);
+    [BW1,BW0,result]=draw_cell_cilia(bw_Image,blob2,cili_blob,cili_Image,im_Image,bw_ImageC,p);
 
-    eval(['save(''result_' num2str(IMi) '.mat'',''IMseries'',''blob'',''blob2'',''cili_blob'',''BW1'',''BW0'',''result'',''ori_Image'',''p'');']);
+    eval(['save(''result_' num2str(IMi) '.mat'',''IMseries'',''blob'',''blob2'',''cili_blob'',''BW1'',''BW0'',''result'',''im_Image'',''p'');']);
     end
 end
 end
 function p=parameter_setting()
-p.FileName='WT10%FBS60X1.tif';
-p.rgb=3;
-p.rgb2=23;
-p.thresholdValue = 150;
-p.cilia_thresholdValue = 1500;
 
-p.se_tophat=30;
-p.se_open=15;
-p.se_erode=5;
-p.num_erode=1;
-p.maxgray_o=65536;
-p.maxgray_new=4000;
-p.threhold_step=100;
+    p.FileName='WT10%FBS60X1.tif';
+    p.MultiPages=0;  % =1 when consider multi-page images in cell segmentation, not=0
+    p.MaxImage=0;
 
-p.displayimage='off';   % 'off' or 'on'
+%% pre-image before iteration
+
+% 2D Gaussian filter
+    p.gauss1_hsize = 5;
+    p.gauss1_sigma = 3;
+% opening and closing,tophat 
+    p.strel1_size = 5;
+    p.se_tophat1=30;
+    p.se_open1=15;
+    p.se_erode1=5;
+    p.num_erode1=1;
+% Threshold into bw
+    p.init_bwthreshold = 100;
+    p.cilia_thresholdValue = 1500;
+
+%% iteration segmentation    
+    p.threhold_step=100;
+
+%% Figure display setting
+p.displayimage='on';   % 'off' or 'on'
 p.displayimage1='on';
+
+
+
+%% Image info
+folder = fileparts(which(p.FileName));
+fullFileName = fullfile(folder,p.FileName);
+ImInfo=imfinfo(fullFileName);
+p.Image_ny=ImInfo(1,1).Width;
+p.Image_nx=ImInfo(1,1).Height;
+p.Image_pageN=size(ImInfo,1);
+p.Image_format=ImInfo(1,1).Format;
+p.Image_location=ImInfo(1,1).Filename;
+p.Image_Bit=ImInfo(1,1).BitDepth;
+p.Image_colorType=ImInfo(1,1).ColorType;
+p.Image_Xresol=ImInfo(1,1).XResolution;
+p.Image_Yresol=ImInfo(1,1).YResolution;
+p.Image_ResolUnit=ImInfo(1,1).ResolutionUnit;
+p.Image_maxIvalue=ImInfo(1,1).MaxSampleValue;
 
 
 % programming process control
 end
-function binaryImage=PreImage(IM,p,thresh)
 
-%% == 1. Image Top-hat filtering ==
+% main function
+function varargout=PreImage(IM,p,varargin)
+% Pre Image process before iteration
+% [input]: IM, p, varargin={bw_threshold}
+% [output]: varargout={IM, bw}
+% [*1]: if bw_threshold==-1 or varargin==-1, then bw=[];
 
-originalImage=filter_tophat(IM,p.se_tophat,1);
-%figure;imshow(originalImage);
+% >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+% 2D gaussian filter
+h=fspecial('gaussian',p.gauss1_hsize,p.gauss1_sigma);
+p.se = strel('disk',p.strel1_size);
+IM=imfilter(IM,h);
 
+% Image Top-hat filtering 
+IM=filter_tophat(IM,p.se_tophat1,1);
 
-%% == 2. Draw histogram and use threshold value to identify object ==
-[~,binaryImage]=imhist_re(originalImage,p.maxgray_o,p.maxgray_new,p,thresh);
+% Draw histogram and use threshold value to identify object
+%[~,binaryImage]=imhist_re(originalImage,p.maxgray_o,p.maxgray_new,p,thresh);
+if isempty(varargin)==1
+    if p.init_bwthreshold==-1
+        bw = [];
+    else
+        bw = IM > p.init_bwthreshold;
+    end
+else
+    if varargin{1}==-1
+        bw = [];
+    else
+        bw = IM > varargin{1};
+    end
+end
 
+% Morphologically open image 
+bw=filter_open(bw,p.se_open1,1);
 
-%% == 3. Morphologically open image ==
-binaryImage=filter_open(binaryImage,p.se_open,1);
-%figure;imshow(binaryImage);
+% Morphologically erode image
+% bw=filter_erode(bw,p.se_erode1,p.num_erode1);
 
-
-%% == 4. Morphologically erode image ==
-%binaryImage=filter_erode(binaryImage,p.se_erode,p.num_erode);
-%figure;imshow(binaryImage);
+% varargout output
+nout = max(nargout,1);
+varargout{1}=IM;
+if nout==2
+    varargout{2}=bw;
+end
 
     function [pixelC,binaryImage]=imhist_re(originalImage,maxgray_o,maxgray_new,p,thresh)
         %Draw histogram figure and use threshold value to cut image
@@ -100,15 +177,26 @@ binaryImage=filter_open(binaryImage,p.se_open,1);
         %hold off;
     end
 end
-function [binaryImage2,blob,blob2]=BlobImage(binaryImage,originalImage,p)
+function [binaryImage2,blob,blob2]=BlobImage(p,originalImage,varargin)
 % Image process for one image
+% input: p, IM, varargin={binaryImage,ori_Image0,IMi}
 
-%% == 5. Get all the blob properties and draw boundary ==
+% >>>>>>>>>>>>>>>>>>>>>>>>>>>
+% varargin input
+binaryImage=varargin{1};
+
+% BlobInfo
 blob=BlobInfo(binaryImage,originalImage,p);
-%binaryImage2=Seperate_blob(blob,binaryImage,p);
-binaryImage2=Seperate_blob(blob,p);
+
+% Seperate blob
+if size(varargin,2)==3
+    binaryImage2=Seperate_blob(blob,p,varargin{1},varargin{2},varargin{3}); % input: (blob, binaryImage,ori_Image0,IMi)
+elseif size(varargin,2)==1
+    binaryImage2=Seperate_blob(blob,p,varargin{1}); % input: (blob, binaryImage)
+end
+
+% Blob info after blob seperation
 blob2=BlobInfo(binaryImage2,originalImage,p);
-%BlobBounrady(binaryImage2,originalImage,p);
 
     function [blob,blobMeasurements]=BlobInfo(BW,IM,p)
         % Get all the blob properties and draw boundary
@@ -120,7 +208,6 @@ blob2=BlobInfo(binaryImage2,originalImage,p);
         numberOfBlobs = size(blobMeasurements, 1);
         
         eval(['figure(''visible'',''' p.displayimage ''');imshow(BW);']); 
-        %figure('visible','off');imshow(BW); 
         hold on;
         for k = 1 : numberOfBlobs
             blob{k}.thisBlobsPixels = blobMeasurements(k).PixelIdxList;
@@ -273,7 +360,7 @@ function [BW1,BW0,result]=draw_cell_cilia(binaryImage,blob,cili_blob,cili_Image,
     % Draw boundary-marker-cell with cilia figure
     %figure;imagesc(ori_Image);
     eval(['figure(''visible'',''' p.displayimage1 ''');imagesc(ori_Image);']); 
-    colormap parula;
+    colormap jet;
     hold on;
     for k = 1 : size(table1,1)
         textFontSize = 8;labelShiftX = -2;
@@ -299,7 +386,7 @@ function [BW1,BW0,result]=draw_cell_cilia(binaryImage,blob,cili_blob,cili_Image,
     % Draw all boundary-marker-cell figure
     %figure;imagesc(ori_Image);
     eval(['figure(''visible'',''' p.displayimage1 ''');imagesc(ori_Image);']); 
-    colormap parula;
+    colormap jet;
     hold on;
     for k = 1 : size(blob,2)
         textFontSize = 8;labelShiftX = -2;
@@ -429,14 +516,17 @@ function IM2=filter_close(IM1,se_close,n_close)
 end
 
 % Seperate blob
-function binaryImage2=Seperate_blob(blob,p)
-% [ image watershed transform ]
-% binaryImage2=Seperate_blob(blob,binaryImage,p)
+function binaryImage2=Seperate_blob(blob,p,varargin)
+% Apply iteration cell seperate process to images
+% [Input]: blob, p, varargin={binaryImage,ori_Image0,IMi}
+% [Output]: bw
 
+% >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 thed=0.9;
 thed2=10;
 mac_whilen=20;
 
+ori_Image=varargin{1};
 binaryImage2=zeros(p.ny,p.nx);
 for bi=1:size(blob,2);
     obj=0;threshold_o=p.thresholdValue;whilen=0;
@@ -448,21 +538,22 @@ for bi=1:size(blob,2);
         if exist('BW_ada','var')==1
             IM2d=BW_ada;
         else
-            IM2d=B.Image;
-            IM3d=zeros(size(IM2d));
-            for k=1:B.blobArea
-                IM3d(B.PixelList(k,2)-B.BoundingBox(1,2)+0.5,B.PixelList(k,1)-B.BoundingBox(1,1)+0.5)=B.PixelValues(k,1);
+            IM2d=B.Image;Bb=B.BoundingBox;
+            IM3d=ori_Image(Bb(2)+0.5:Bb(2)+Bb(4),Bb(1)+0.5:Bb(1)+Bb(3));
+            if p.MultiPages==1
+                Imi=varargin{3};Bb=B.BoundingBox;
+                ori_Image0=varargin{2};
             end
             pre_area=B.blobArea;
         end
-        %figure;imagesc(IM2d);
+        figure;imagesc(IM2d);figure;imagesc(IM3d);
         [BW2,BWedge]=edge_add(IM2d);
         k2=conv_point(BWedge,thed,IM2d);
         IM2d_blob=link_neck(IM2d,k2,BWedge,thed2);
         %figure;imagesc(IM2d_blob);
         labeledImage = bwlabel(IM2d_blob, 4);
         blobMeasurements = regionprops(labeledImage, IM3d, 'all');
-        sum_solod=0;num_solod=0;tol_area=0;
+        sum_solod=0;num_solod=0;tol_area=0
         %IM3d=zeros(size(IM2d));
         for bb=1:size(blobMeasurements,1)
             tol_area=tol_area+blobMeasurements(bb).Area;
@@ -474,13 +565,13 @@ for bi=1:size(blob,2);
         end
         %figure;imagesc(IM3d);
         ave_solod=sum_solod/num_solod;
-        if abs(tol_area-pre_area)/pre_area>0.3||tol_area==0
+        [IM3d,BW_ada]=PreImage(IM3d,p,threshold_o);
+        if abs(tol_area-pre_area)/pre_area>0.3||sum(sum(BW_ada))==0
             obj=1;IM2d_blob=pre_IM2d_blob;IM3d=pre_IM3d;
         elseif ave_solod>0.95
             obj=1;
         else
             threshold_o=threshold_o+p.threhold_step;
-            BW_ada=PreImage(IM3d,p,threshold_o);
         end
         whilen=whilen+1;pre_area=tol_area;
         pre_IM2d_blob=IM2d_blob;pre_IM3d=IM3d;
@@ -958,6 +1049,63 @@ for i=1:n
     d(i,1)=sqrt((M(i,1)-ma(1,1))^2+(M(i,2)-ma(1,2))^2);
 end
 end
+function bwout=seperate(immask2,area1)    
+
+    se_mask = regionprops(immask2,'Area');
+    se_area = [se_mask.Area];
+    bwout = false(size(immask2));   %%% Output mask initialization
+
+    r1 = sqrt(area1/pi);   %%% estimated radius of a single nucleus
+
+%% Partition: %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+bwraw = immask2;
+%bwraw = bwareaopen(bwraw,round(area1*0.5));   %%% remove small areas
+
+%%% Estimation of the number of nuclei included in each recognized regions
+se_mask = regionprops(bwraw,'Area');   %%% area calculation
+nmask = round([se_mask.Area]./area1);   %%% calculate the estimated # of nuclei for each recognized area
+lmask = bwlabel(bwraw);   %%% mask labeling
+
+%%% Filter out the merged nuclei
+bwout(ismember(lmask,find(nmask <= 1))) = true;   %%% Add the single nuclei areas to the output mask
+bwraw(ismember(lmask,find(nmask <= 1))) = false;   %%% Remove the single nuclei areas from the raw mask
+
+if any(any(bwraw))
+    %%% Watersheding to chop merged nuclei
+    D= bwdist(~bwraw);
+    g = imfilter(double(bwraw),double(getnhood(strel('disk',round(r1*0.75)))),'symmetric','corr');
+    g2 = imimposemin(-D,imdilate(imregionalmax(g),strel('disk',5)));
+    L2 = watershed(g2);
+    bwnew = bwraw & (~(L2 == 0));
+    bwout = bwout | bwnew;
+end
+%% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% Convex the recognized regions: %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% se_mask = regionprops(bwout,'Area');
+% se_area = [se_mask.Area];
+% bwout = ismember(bwlabel(bwout),find(se_area > 1000));
+
+%bwout0 = bwout;
+se_mask = regionprops(bwout,'ConvexImage','BoundingBox');
+bwout = zeros(size(bwout));
+bwp = zeros(size(bwout));
+if size(se_mask(:),1)>0
+    for I_temp = 1:length(se_mask)
+        x1 = uint16(se_mask(I_temp).BoundingBox(2));
+        x2 = uint16(x1+se_mask(I_temp).BoundingBox(4)-1);
+        y1 = uint16(se_mask(I_temp).BoundingBox(1));
+        y2 = uint16(y1+se_mask(I_temp).BoundingBox(3)-1);
+        bwout(x1:x2,y1:y2) = bwout(x1:x2,y1:y2) + double(se_mask(I_temp).ConvexImage);
+        bwp(x1:x2,y1:y2) = bwp(x1:x2,y1:y2) | bwperim(se_mask(I_temp).ConvexImage);
+    end
+end
+
+bwout = logical(bwout == 1) & (~bwp);
+bwout = imerode(bwout,strel('disk',5));
+bwout = bwconvhull(bwout,'objects');
+bwout = bwmorph(bwout,'thicken',5);
+end
 
 % sub-function
 function [IMseries,tinfo]=ImageTiffSeries(tif_name)
@@ -1052,5 +1200,74 @@ k2=k0';
     end
     ded_vec(1,1)=dot(vec(1,1:2)/sqrt(vec(1,1)^2+vec(1,1)^2),vec(a,1:2)/sqrt(vec(a,1)^2+vec(a,1)^2));   
     end
+end
+function binaryImage2=Seperate_blob_old(blob,p,varargin)
+% [ image watershed transform ]
+% binaryImage2=Seperate_blob(blob,binaryImage,p)
+
+thed=0.9;
+thed2=10;
+mac_whilen=20;
+
+binaryImage2=zeros(p.ny,p.nx);
+for bi=1:size(blob,2);
+    obj=0;threshold_o=p.thresholdValue;whilen=0;
+    
+    % Adaptive blob modification
+    while obj==0&&whilen<mac_whilen
+        
+        B=blob{bi};
+        if exist('BW_ada','var')==1
+            IM2d=BW_ada;
+        else
+            IM2d=B.Image;
+            IM3d(1:size(allimage,2))={zeros(size(IM2d))};Bb=B.BoundingBox;
+            for k=1:size(allimage,2)
+                IM3d{k}=allimage{k}(Bb(2)+0.5:Bb(2)+Bb(4)-1,Bb(1)+0.5:Bb(1)+Bb(3)-1);
+            end
+            pre_area=B.blobArea;
+        end
+        %figure;imagesc(IM2d);
+        [BW2,BWedge]=edge_add(IM2d);
+        k2=conv_point(BWedge,thed,IM2d);
+        IM2d_blob=link_neck(IM2d,k2,BWedge,thed2);
+        %figure;imagesc(IM2d_blob);
+        labeledImage = bwlabel(IM2d_blob, 4);
+        blobMeasurements = regionprops(labeledImage, IM3d, 'all');
+        sum_solod=0;num_solod=0;tol_area=0;
+        %IM3d=zeros(size(IM2d));
+        for bb=1:size(blobMeasurements,1)
+            tol_area=tol_area+blobMeasurements(bb).Area;
+            sum_solod=sum_solod+blobMeasurements(bb).Solidity;
+            num_solod=num_solod+1;           
+            for k=1:blobMeasurements(bb).Area
+                %IM3d(blobMeasurements(bb).PixelList(k,2),blobMeasurements(bb).PixelList(k,1))=blobMeasurements(bb).PixelValues(k,1);
+            end
+        end
+        %figure;imagesc(IM3d);
+        ave_solod=sum_solod/num_solod;
+        [IM3d,BW_ada]=PreImage(IM3d,p,threshold_o);
+        if abs(tol_area-pre_area)/pre_area>0.3||sum(sum(BW_ada))==0
+            obj=1;IM2d_blob=pre_IM2d_blob;IM3d=pre_IM3d;
+        elseif ave_solod>0.95
+            obj=1;
+        else
+            threshold_o=threshold_o+p.threhold_step;
+        end
+        whilen=whilen+1;pre_area=tol_area;
+        pre_IM2d_blob=IM2d_blob;pre_IM3d=IM3d;
+    end
+   
+    % Draw inaryImage2
+    for kx=1:size(IM2d_blob,2)
+        for ky=1:size(IM2d_blob,1)
+            if IM2d_blob(ky,kx)==1
+                binaryImage2(ky+B.BoundingBox(1,2)-0.5,kx+B.BoundingBox(1,1)-0.5)=1;
+            end
+        end
+    end
+    clear BW_ada;
+end    
+   binaryImage2=im2bw(binaryImage2); 
 end
 
